@@ -159,6 +159,14 @@ add_winml_test(
 )
 target_include_directories(winml_test_concurrency PRIVATE ${ONNXRUNTIME_ROOT}/core/graph)
 
+file(GLOB winml_test_adapter_src CONFIGURE_DEPENDS "${WINML_TEST_SRC_DIR}/adapter/*.cpp")
+add_winml_test(
+  TARGET winml_test_adapter
+  SOURCES ${winml_test_adapter_src}
+  LIBS winml_test_common winml_adapter
+)
+target_include_directories(winml_test_concurrency PRIVATE ${ONNXRUNTIME_ROOT}/winml/lib/Api.Ort)
+
 # During build time, copy any modified collaterals.
 # configure_file(source destination COPYONLY), which configures CMake to copy the file whenever source is modified,
 # can't be used here because we don't know the destination during configure time (in multi-configuration generators,
