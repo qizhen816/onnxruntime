@@ -17,6 +17,7 @@
 #include "core/optimizer/rule_based_graph_transformer.h"
 #include "orttraining/core/graph/mixed_precision_transformer.h"
 #include "orttraining/core/graph/tensorboard_transformer.h"
+#include "orttraining/core/graph/pipeline_transformer.h"
 #include "orttraining/core/graph/gradient_builder_base.h"
 
 //Gist Encoding
@@ -148,17 +149,29 @@ Status TrainingSession::ConfigureForTraining(
       "Exactly one of loss_function_config or loss_name should be given.");
 
   std::string loss_name{};
-  if (config.loss_function_config.has_value()) {
-    const auto& loss_function_config = config.loss_function_config.value();
-    ORT_RETURN_IF_ERROR(BuildLossFunction(
-        loss_function_config.loss_function_info, loss_scale_input_name, loss_name));
+  if (config.use_pipeline){
+    // if use pipeline, first check if model contains send op. If it does, set the
+    // send node's output as the start tensor to build gradient graph
+    GetPipelineSendOutput(model_->MainGraph(), loss_name);
+  }
 
-    if (IsRootNode(config) && config.model_with_loss_function_path.has_value()) {
-      ORT_IGNORE_RETURN_VALUE(Save(
-          config.model_with_loss_function_path.value(), SaveOption::NO_RELOAD));
+  // If loss_name is empty, it could be one of those two scenarios:
+  //    1) it is a regular training graph that doesn't contain pipeline ops
+  //    2) it is the last stage of the pipeline partition
+  // In these cases, add the loss_name based on training config.
+  if (loss_name.empty()) {
+    if (config.loss_function_config.has_value()) {
+      const auto& loss_function_config = config.loss_function_config.value();
+      ORT_RETURN_IF_ERROR(BuildLossFunction(
+          loss_function_config.loss_function_info, loss_scale_input_name, loss_name));
+
+      if (IsRootNode(config) && config.model_with_loss_function_path.has_value()) {
+        ORT_IGNORE_RETURN_VALUE(Save(
+            config.model_with_loss_function_path.value(), SaveOption::NO_RELOAD));
+      }
+    } else {
+      loss_name = config.loss_name.value();
     }
-  } else {
-    loss_name = config.loss_name.value();
   }
 
   // derive actual set of weights to train
@@ -179,7 +192,6 @@ Status TrainingSession::ConfigureForTraining(
                                  << weight_names_stream.str();
   }
 
-  // add gradient graph
   ORT_RETURN_IF_ERROR(BuildGradientGraph(
       weight_names_to_train, loss_name, config.set_gradients_as_graph_outputs));
 
@@ -245,6 +257,10 @@ Status TrainingSession::ConfigureForTraining(
   // add GIST encoding
   if (config.gist_config.has_value()) {
     ORT_RETURN_IF_ERROR(AddGistEncoding());
+  }
+
+  if (config.use_pipeline) {
+    ORT_RETURN_IF_ERROR(InsertPipelineOps());
   }
 
   if (IsRootNode(config) && config.model_with_training_graph_path.has_value()) {
@@ -423,6 +439,11 @@ Status TrainingSession::AddTensorboard(const std::string& summary_name,
   ORT_RETURN_IF_ERROR(
       TransformGraphForTensorboard(
           model_->MainGraph(), summary_name, scalar_nodes, histogram_nodes, norm_nodes, dump_convergence_metrics));
+  return DoPostLoadProcessing(*model_);
+}
+
+Status TrainingSession::InsertPipelineOps() {
+  ORT_RETURN_IF_ERROR(TransformGraphForPipeline(model_->MainGraph()));
   return DoPostLoadProcessing(*model_);
 }
 
