@@ -163,7 +163,7 @@ file(GLOB winml_test_adapter_src CONFIGURE_DEPENDS "${WINML_TEST_SRC_DIR}/adapte
 add_winml_test(
   TARGET winml_test_adapter
   SOURCES ${winml_test_adapter_src}
-  LIBS onnxruntime_common onnxruntime_session winml_adapter winml_lib_ort winml_test_common
+  LIBS onnxruntime_common onnxruntime_graph onnxruntime_mlas onnxruntime_session onnxruntime_util winml_adapter winml_lib_ort winml_test_common
 )
 target_include_directories(winml_test_adapter PRIVATE ${REPO_ROOT}/winml/lib/Api.Ort)
 
