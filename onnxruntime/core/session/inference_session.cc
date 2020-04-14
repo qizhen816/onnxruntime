@@ -164,7 +164,6 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
 
   // The call to InitLogger depends on the final state of session_options_. Hence it should be invoked
   // after the invocation of FinalizeSessionOptions.
-  logging_manager_ = session_env.GetLoggingManager();
   InitLogger(logging_manager_);  // this sets session_logger_ so that it can be used for logging after this point.
 
   // Update the number of steps for the graph transformer manager using the "finalized" session options
@@ -180,10 +179,9 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
       }
       // If the thread pool can use all the processors, then
       // we set affinity of each thread to each processor.
-      if (to.thread_pool_size == 0 && session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL && to.affinity_vec_len == 0)
-        to.auto_set_affinity = true;
-      else
-        to.auto_set_affinity = false;
+      to.auto_set_affinity = to.thread_pool_size == 0 &&
+                             session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL &&
+                             to.affinity_vec_len == 0;
       thread_pool_ =
           concurrency::CreateThreadPool(&Env::Default(), to, nullptr);
     }
@@ -191,10 +189,8 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
       OrtThreadPoolParams to = session_options_.inter_op_param;
       // If the thread pool can use all the processors, then
       // we set thread affinity.
-      if (to.thread_pool_size == 0 && session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL)
-        to.auto_set_affinity = true;
-      else
-        to.auto_set_affinity = false;
+      to.auto_set_affinity =
+          to.thread_pool_size == 0 && session_options_.execution_mode == ExecutionMode::ORT_SEQUENTIAL;
       if (to.name == nullptr)
         to.name = ORT_TSTR("intra-op");
       inter_op_thread_pool_ =
@@ -208,7 +204,7 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
     LOGS(*session_logger_, INFO) << "Using global/env threadpools since use_per_session_threads_ is false";
     intra_op_thread_pool_from_env_ = session_env.GetIntraOpThreadPool();
     inter_op_thread_pool_from_env_ = session_env.GetInterOpThreadPool();
-    ORT_ENFORCE(session_env.EnvCreatedWithGlobalThreadPools() == true,
+    ORT_ENFORCE(session_env.EnvCreatedWithGlobalThreadPools(),
                 "When the session is not configured to use per session"
                 " threadpools, the env must be created with the the CreateEnvWithGlobalThreadPools API.");
   }
@@ -231,20 +227,20 @@ void InferenceSession::ConstructorCommon(const SessionOptions& session_options,
   session_id_ = global_session_id_.fetch_add(1);
 }
 
-InferenceSession::InferenceSession(const SessionOptions& session_options,
-                                   const Environment& session_env)
+InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env)
     : graph_transformation_mgr_(session_options.max_num_graph_transformation_steps),
+      logging_manager_(session_env.GetLoggingManager()),
       insert_cast_transformer_("CastFloat16Transformer") {
   // Initialize assets of this session instance
   ConstructorCommon(session_options, session_env);
 }
 
-InferenceSession::InferenceSession(const SessionOptions& session_options,
-                                   const Environment& session_env,
+InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env,
                                    const std::string& model_uri)
-    : graph_transformation_mgr_(session_options.max_num_graph_transformation_steps),
+    : model_location_(ToWideString(model_uri)),
+      graph_transformation_mgr_(session_options.max_num_graph_transformation_steps),
+      logging_manager_(session_env.GetLoggingManager()),
       insert_cast_transformer_("CastFloat16Transformer") {
-  model_location_ = ToWideString(model_uri);
   auto status = Model::Load(model_location_, model_proto_);
   ORT_ENFORCE(status.IsOK(), "Given model could not be parsed while creating inference session. Error message: ",
               status.ErrorMessage());
@@ -269,10 +265,10 @@ InferenceSession::InferenceSession(const SessionOptions& session_options,
 }
 #endif
 
-InferenceSession::InferenceSession(const SessionOptions& session_options,
-                                   const Environment& session_env,
+InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env,
                                    std::istream& model_istream)
     : graph_transformation_mgr_(session_options.max_num_graph_transformation_steps),
+      logging_manager_(session_env.GetLoggingManager()),
       insert_cast_transformer_("CastFloat16Transformer") {
   google::protobuf::io::IstreamInputStream zero_copy_input(&model_istream);
   const bool result = model_proto_.ParseFromZeroCopyStream(&zero_copy_input) && model_istream.eof();
@@ -282,11 +278,10 @@ InferenceSession::InferenceSession(const SessionOptions& session_options,
   ConstructorCommon(session_options, session_env);
 }
 
-InferenceSession::InferenceSession(const SessionOptions& session_options,
-                                   const Environment& session_env,
-                                   const void* model_data,
-                                   int model_data_len)
+InferenceSession::InferenceSession(const SessionOptions& session_options, const Environment& session_env,
+                                   const void* model_data, int model_data_len)
     : graph_transformation_mgr_(session_options.max_num_graph_transformation_steps),
+      logging_manager_(session_env.GetLoggingManager()),
       insert_cast_transformer_("CastFloat16Transformer") {
   const bool result = model_proto_.ParseFromArray(model_data, model_data_len);
   ORT_ENFORCE(result, "Could not parse model successfully while constructing the inference session");
@@ -365,7 +360,7 @@ common::Status InferenceSession::AddCustomTransformerList(const std::vector<std:
 common::Status InferenceSession::AddCustomOpDomains(const std::vector<OrtCustomOpDomain*>& op_domains) {
   std::shared_ptr<CustomRegistry> custom_registry;
   ORT_RETURN_IF_ERROR_SESSIONID_(CreateCustomRegistry(op_domains, custom_registry));
-  RegisterCustomRegistry(custom_registry);
+  ORT_RETURN_IF_ERROR_SESSIONID_(RegisterCustomRegistry(custom_registry));
   return Status::OK();
 }
 

@@ -368,7 +368,10 @@ static void MoveOrtCallback(OrtCallback& from, OrtCallback& to) {
   from.f = nullptr;
   from.param = nullptr;
 }
-
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 6239)
+#endif
 Status TensorProtoToMLValue(const Env& env, const ORTCHAR_T* tensor_proto_path,
                             const ONNX_NAMESPACE::TensorProto& tensor_proto, const MemBuffer& m, OrtValue& value,
                             OrtCallback& deleter) {
@@ -486,7 +489,10 @@ Status TensorProtoToMLValue(const Env& env, const ORTCHAR_T* tensor_proto_path,
              ml_tensor->GetDeleteFunc());
   return Status::OK();
 }
-
+#ifdef _MSC_VER
+#pragma warning(pop)
+#pragma warning(disable : 6239)
+#endif
 #define CASE_TYPE(X)                             \
   case ONNX_NAMESPACE::TensorProto_DataType_##X: \
     return ONNX_TENSOR_ELEMENT_DATA_TYPE_##X;
