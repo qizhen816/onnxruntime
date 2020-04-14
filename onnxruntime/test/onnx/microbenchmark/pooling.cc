@@ -91,11 +91,11 @@ static void RunPool2D(const OrtThreadPoolParams& param, int64_t batch_size, benc
 	int64_t input_shape[] = { 1, 64, 112, 112 };
 	std::vector<int64_t> kernel_shape = { 3, 3 };
 	std::vector<int64_t> padding = { 0, 0, 1, 1 };
-	int64_t stride_shape[] = { 2, 2 };
-	int64_t output_shape[] = { 1, 64, 56, 56 };
-	input_shape[0] = batch_size;
-	output_shape[0] = batch_size;
-	std::random_device rd;
+        // int64_t stride_shape[] = { 2, 2 };
+        int64_t output_shape[] = {1, 64, 56, 56};
+        input_shape[0] = batch_size;
+        output_shape[0] = batch_size;
+        std::random_device rd;
 	std::mt19937 gen(rd());
 	std::uniform_real_distribution<float> dist(-10, 10);
 	std::vector<float> input(CalcSize(input_shape, 4));

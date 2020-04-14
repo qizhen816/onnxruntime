@@ -34,7 +34,7 @@ static void BM_BatchNormEigenTensor(benchmark::State& state) {
   var_arr.setRandom();
   Eigen::Tensor<T, 2, Eigen::RowMajor, Eigen::DenseIndex> output_tensor(N * C, sample_size);
 
-  float epsilon_ = 1e-5;
+  float epsilon_ = 1e-5f;
   for (auto _ : state) {
     Eigen::Tensor<T, 1, Eigen::RowMajor, Eigen::DenseIndex> eps(C);
     eps.setConstant(epsilon_);
@@ -77,7 +77,7 @@ static void BM_BatchNormEigenTensorSingleThread(benchmark::State& state) {
   var_arr.setRandom();
   Eigen::Tensor<T, 2, Eigen::RowMajor, Eigen::DenseIndex> output_tensor(N * C, sample_size);
 
-  float epsilon_ = 1e-5;
+  float epsilon_ = 1e-5f;
   for (auto _ : state) {
     Eigen::Tensor<T, 1, Eigen::RowMajor, Eigen::DenseIndex> eps(C);
     eps.setConstant(epsilon_);

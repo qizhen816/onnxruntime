@@ -38,10 +38,11 @@ void SimpleForLoop(ptrdiff_t first, ptrdiff_t last) {
 
 static void BM_ThreadPoolParallelFor(benchmark::State& state) {
 	const size_t len = state.range(0);
-	const int cost = state.range(1);
-	OrtThreadPoolParams tpo;
-	std::unique_ptr<concurrency::ThreadPool> tp(concurrency::CreateThreadPool(&onnxruntime::Env::Default(), tpo, nullptr));
-	for (auto _ : state) {
+        const int cost = static_cast<int>(state.range(1));
+        OrtThreadPoolParams tpo;
+        std::unique_ptr<concurrency::ThreadPool> tp(
+            concurrency::CreateThreadPool(&onnxruntime::Env::Default(), tpo, nullptr));
+        for (auto _ : state) {
 		tp->ParallelFor(len, cost, SimpleForLoop);
 	}
 }
@@ -108,16 +109,16 @@ static void BM_SimpleScheduleWait(benchmark::State& state) {
 
 	for (auto _ : state) {
 		onnxruntime::Barrier barrier(static_cast<unsigned int>(threads));
-		for (std::ptrdiff_t id = 0; id < threads; ++id) {
-			tp->Schedule([id, threads, len, &barrier]() {
-				std::ptrdiff_t start, work_remaining;
-				TestPartitionWork(id, threads, len, &start, &work_remaining);
-				SimpleForLoop(start, start + work_remaining);
-				barrier.Notify();
-				});
-		}
-		barrier.Wait();
-	}
+                for (std::ptrdiff_t id = 0; id < static_cast<std::ptrdiff_t>(threads); ++id) {
+                  tp->Schedule([id, threads, len, &barrier]() {
+                    std::ptrdiff_t start, work_remaining;
+                    TestPartitionWork(id, threads, len, &start, &work_remaining);
+                    SimpleForLoop(start, start + work_remaining);
+                    barrier.Notify();
+                  });
+                }
+                barrier.Wait();
+        }
 }
 BENCHMARK(BM_SimpleScheduleWait)->UseRealTime()->Unit(benchmark::TimeUnit::kNanosecond)->Arg(100)->Arg(1000)->Arg(10000)->Arg(20000)->Arg(40000)->Arg(80000)->Arg(160000);
 
@@ -129,17 +130,13 @@ struct Param {
 	std::ptrdiff_t len;
 	onnxruntime::Barrier* barrier;
 };
-VOID NTAPI SimpleCalc(
-	_Inout_     PTP_CALLBACK_INSTANCE Instance,
-	_Inout_opt_ PVOID                 Context,
-	_Inout_     PTP_WORK              Work
-) {
-	Param* p = (Param*)Context;
-	std::ptrdiff_t start, work_remaining;
-	int id = p->id++;
-	TestPartitionWork(id, p->threads, p->len, &start, &work_remaining);
-	SimpleForLoop(start, start + work_remaining);	  
-	p->barrier->Notify();
+VOID NTAPI SimpleCalc(_Inout_ PTP_CALLBACK_INSTANCE, _Inout_ PVOID Context, _Inout_ PTP_WORK) {
+  Param* p = (Param*)Context;
+  std::ptrdiff_t start, work_remaining;
+  int id = p->id++;
+  TestPartitionWork(id, p->threads, p->len, &start, &work_remaining);
+  SimpleForLoop(start, start + work_remaining);
+  p->barrier->Notify();
 }
 
 static void BM_SimpleScheduleWaitWindowsTP(benchmark::State& state) {
