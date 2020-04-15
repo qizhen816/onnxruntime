@@ -27,14 +27,15 @@ using namespace winrt::Windows::Storage;
 using namespace winrt::Windows::Storage::Streams;
 
 namespace {
-WinML::OnnxruntimeEngineFactory *engine_factory;
+com_ptr<WinML::OnnxruntimeEngineFactory> engine_factory;
 const OrtApi *ort_api;
 const WinmlAdapterApi *winml_adapter_api;
 OrtEnv* ort_env;
 
 void AdapterSessionTestSetup() {
   init_apartment();
-  WINML_EXPECT_HRESULT_SUCCEEDED(Microsoft::WRL::MakeAndInitialize<WinML::OnnxruntimeEngineFactory>(&engine_factory));
+  engine_factory = nullptr;
+  WINML_EXPECT_HRESULT_SUCCEEDED(Microsoft::WRL::MakeAndInitialize<WinML::OnnxruntimeEngineFactory>(engine_factory.put()));
   WINML_EXPECT_HRESULT_SUCCEEDED(engine_factory->GetOrtEnvironment(&ort_env));
   WINML_EXPECT_HRESULT_SUCCEEDED(engine_factory->EnableDebugOutput(true));
   WINML_EXPECT_NOT_EQUAL(nullptr, winml_adapter_api = engine_factory->UseWinmlAdapterApi());
@@ -52,20 +53,18 @@ void AppendExecutionProvider_CPU() {
   THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_CPU(session_options.get(), true), ort_api);
 }
 
-ID3D12Device* CreateD3DDevice() {
-  ID3D12Device* device = nullptr;
-  WINML_EXPECT_NO_THROW(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL::D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device)));
+com_ptr<ID3D12Device> CreateD3DDevice() {
+  com_ptr<ID3D12Device> device;
+  WINML_EXPECT_NO_THROW(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL::D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(device.put())));
   return device;
-  // TODO Check for leaks
 }
 
-ID3D12CommandQueue* CreateD3DQueue(ID3D12Device* device) {
-  ID3D12CommandQueue* queue = nullptr;
+com_ptr<ID3D12CommandQueue> CreateD3DQueue(ID3D12Device* device) {
+  com_ptr<ID3D12CommandQueue> queue;
   D3D12_COMMAND_QUEUE_DESC command_queue_desc = {};
   command_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-  device->CreateCommandQueue(&command_queue_desc, __uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&queue));
+  device->CreateCommandQueue(&command_queue_desc, IID_PPV_ARGS(queue.put()));
   return queue;
-  // TODO Check for leaks
 }
 
 UniqueOrtSession CreateUniqueOrtSession(const UniqueOrtSessionOptions& session_options) {
@@ -88,8 +87,8 @@ void AppendExecutionProvider_DML() {
   const auto session_options = CreateUniqueOrtSessionOptions();
 
   const auto device = CreateD3DDevice();
-  const auto queue = CreateD3DQueue(device);
-  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device, queue), ort_api);
+  const auto queue = CreateD3DQueue(device.get());
+  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device.get(), queue.get()), ort_api);
 }
 
 void CreateWithoutModel() {
@@ -111,8 +110,8 @@ void GetExecutionProvider_DML() {
   const auto session_options = CreateUniqueOrtSessionOptions();
   THROW_IF_NOT_OK_MSG(ort_api->DisableMemPattern(session_options.get()), ort_api);
   const auto device = CreateD3DDevice();
-  const auto queue = CreateD3DQueue(device);
-  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device, queue), ort_api);
+  const auto queue = CreateD3DQueue(device.get());
+  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device.get(), queue.get()), ort_api);
 
   const auto model_path = FileHelpers::GetModulePath() + L"fns-candy.onnx";
   auto session = CreateUniqueOrtSession(model_path, session_options);
@@ -160,7 +159,7 @@ void LoadAndPurloinModel(const UniqueOrtSession& session, const std::string& mod
   com_ptr<WinML::IModel> model;
   WINML_THROW_IF_FAILED(engine_factory->CreateModel(model_path.c_str(), sizeof(model_path), model.put()));
 
-  winrt::com_ptr<WinML::IOnnxruntimeModel> onnxruntime_model;
+  com_ptr<WinML::IOnnxruntimeModel> onnxruntime_model;
   WINML_EXPECT_NO_THROW(onnxruntime_model = model.as<WinML::IOnnxruntimeModel>());
   OrtModel* ort_model;
   WINML_EXPECT_HRESULT_SUCCEEDED(onnxruntime_model->DetachOrtModel(&ort_model));
@@ -181,7 +180,7 @@ void Initialize() {
   const auto model_path = "fns-candy.onnx";
   WINML_THROW_IF_FAILED(engine_factory->CreateModel(model_path, sizeof(model_path), model.put()));
 
-  winrt::com_ptr<WinML::IOnnxruntimeModel> onnxruntime_model;
+  com_ptr<WinML::IOnnxruntimeModel> onnxruntime_model;
   WINML_EXPECT_NO_THROW(onnxruntime_model = model.as<WinML::IOnnxruntimeModel>());
   OrtModel* ort_model;
   WINML_EXPECT_HRESULT_SUCCEEDED(onnxruntime_model->DetachOrtModel(&ort_model));
@@ -241,9 +240,11 @@ void CopyInputAcrossDevices() {
   THROW_IF_NOT_OK_MSG(ort_api->IsTensor(input_tensor, &is_tensor), ort_api);
   WINML_EXPECT_TRUE(is_tensor);
 
-  OrtValue* dest_ort_value = nullptr;
+  OrtValue* dest_ort_value;
   THROW_IF_NOT_OK_MSG(winml_adapter_api->SessionCopyOneInputAcrossDevices(session.get(), "inputImage", input_tensor, &dest_ort_value), ort_api);
 
+  ort_api->ReleaseValue(input_tensor);
+  ort_api->ReleaseValue(dest_ort_value);
   ort_api->ReleaseMemoryInfo(memory_info);
 }
 
@@ -253,8 +254,8 @@ void CopyInputAcrossDevices_DML() {
   const auto session_options = CreateUniqueOrtSessionOptions();
   THROW_IF_NOT_OK_MSG(ort_api->DisableMemPattern(session_options.get()), ort_api);
   const auto device = CreateD3DDevice();
-  const auto queue = CreateD3DQueue(device);
-  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device, queue), ort_api);
+  const auto queue = CreateD3DQueue(device.get());
+  THROW_IF_NOT_OK_MSG(winml_adapter_api->OrtSessionOptionsAppendExecutionProvider_DML(session_options.get(), device.get(), queue.get()), ort_api);
   auto session = CreateUniqueOrtSession(session_options);
 
   LoadAndPurloinModel(session, "fns-candy.onnx");
@@ -280,6 +281,7 @@ void CopyInputAcrossDevices_DML() {
   OrtValue* dest_ort_value = nullptr;
   THROW_IF_NOT_OK_MSG(winml_adapter_api->SessionCopyOneInputAcrossDevices(session.get(), "inputImage", input_tensor, &dest_ort_value), ort_api);
 
+  ort_api->ReleaseValue(input_tensor);
   ort_api->ReleaseMemoryInfo(memory_info);
 }
 }
