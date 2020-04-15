@@ -1230,7 +1230,7 @@ TEST(GradientGraphBuilderTest, TrainingSession_WithPipeline) {
   for (int batch = 0; batch < num_batches; ++batch) {
     EXPECT_TRUE(expected_plan[batch].retired_batches == plan[batch].retired_batches);
     EXPECT_TRUE(expected_plan[batch].events.size() == plan[batch].events.size());
-    for (int evt_id = 0; evt_id < expected_plan[batch].events.size(); ++evt_id) {
+    for (size_t evt_id = 0; evt_id < expected_plan[batch].events.size(); ++evt_id) {
       EXPECT_TRUE(expected_plan[batch].events[evt_id] == plan[batch].events[evt_id]);
     }
   }
