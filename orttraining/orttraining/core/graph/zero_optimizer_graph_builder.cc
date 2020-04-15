@@ -6,6 +6,7 @@
 #include "core/common/common.h"
 #include "core/framework/tensorprotoutils.h"
 #include "core/graph/graph.h"
+#include "core/optimizer/initializer.h"
 #include "orttraining/core/graph/graph_augmenter.h"
 
 namespace onnxruntime {
@@ -125,7 +126,63 @@ static std::vector<ArgDef> AddViewForParameter(
   return view_outputs;
 }
 
-static Status AddViewForParameters(
+// Helper to return the shape for this partition (only one segment should be 'enabled').
+static TensorShape ShapeForPartition(const std::vector<TensorShape>& shapes, const std::vector<bool>& enabled) {
+  ORT_ENFORCE(shapes.size() == enabled.size());
+  for (size_t i = 0; i < enabled.size(); i++) {
+    if (enabled[i])
+      return shapes[i];
+  }
+  ORT_THROW("Failed to partition initializer.");
+}
+
+// Helper to return the starting tensor offset for this partition (only one segment should be 'enabled').
+static int64_t OffsetForPartition(const std::vector<TensorShape>& shapes, const std::vector<bool>& enabled) {
+  ORT_ENFORCE(shapes.size() == enabled.size());
+  int64_t offset = 0;
+  for (size_t i = 0; i < enabled.size(); i++) {
+    if (enabled[i])
+      return offset;
+    offset += shapes[i].Size();
+  }
+  ORT_THROW("Failed to partition initializer.");
+}
+
+static ArgDef AddPartitionForParameter(
+    Graph& graph,
+    GraphAugmenter::GraphDefs& graph_defs,
+    const std::string& initializer_name,
+    const std::vector<TensorShape>& view_shapes,
+    const std::vector<bool>& enabled) {
+  const ONNX_NAMESPACE::TensorProto* tensor_proto;
+  ORT_ENFORCE(graph.GetInitializedTensor(initializer_name, tensor_proto));
+  ORT_ENFORCE(tensor_proto->data_type() == ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+
+  // Find the initializer partition to read out.
+  auto initializer = onnxruntime::make_unique<Initializer>(*tensor_proto, graph.ModelPath());
+  const float* initializer_data = initializer->data<float>();
+  int64_t partition_offset = OffsetForPartition(view_shapes, enabled);
+  TensorShape partition_shape = ShapeForPartition(view_shapes, enabled);
+
+  // Create new initializer tensor proto.
+  ONNX_NAMESPACE::TensorProto initializer_partition;
+  initializer_partition.set_name(initializer_name);
+  initializer_partition.set_data_type(tensor_proto->data_type());
+  for (int64_t partition_dim : partition_shape.GetDims()) {
+    initializer_partition.add_dims(partition_dim);
+  }
+
+  size_t element_count = partition_shape.Size();
+  initializer_partition.set_raw_data(initializer_data + partition_offset, element_count * sizeof(float));
+
+  graph.RemoveInitializedTensor(initializer_name);
+  graph.AddInitializedTensor(initializer_partition);
+
+  auto dtype = static_cast<ONNX_NAMESPACE::TensorProto_DataType>(tensor_proto->data_type());
+  return ArgDef(initializer_name, graph_defs.CreateTypeProto(partition_shape.GetDims(), dtype));
+}
+
+static Status PartitionParameters(
     Graph& graph,
     GraphAugmenter::GraphDefs& graph_defs,
     ArgDef weight_argdef,
@@ -136,33 +193,33 @@ static Status AddViewForParameters(
     std::vector<OptimizerNodeConfig>& opt_configs,
     std::vector<ArgDef>& weight_argdefs,
     std::vector<ArgDef>& gradient_argdefs) {
-  // Add View for weight.
-  std::vector<ArgDef> weight_views = AddViewForParameter(graph_defs, weight_argdef, view_shapes);
-  weight_argdefs.insert(weight_argdefs.end(), weight_views.begin(), weight_views.end());
+  // Find index of segment that is enabled for this rank.
+  int partition_index = std::distance(enabled.begin(), std::find(enabled.begin(), enabled.end(), true));
 
-  // Add View for gradient.
+  // Add View for gradient, and keep the gradient segment for this rank.
   std::vector<ArgDef> gradient_views = AddViewForParameter(graph_defs, gradient_argdef, view_shapes);
-  gradient_argdefs.insert(gradient_argdefs.end(), gradient_views.begin(), gradient_views.end());
+  gradient_argdefs.push_back(gradient_views[partition_index]);
 
-  // (Optional) Add View for FP16 weight.
+  // Add View or partition weights, and keep the weight segments for this rank.
   std::vector<ArgDef> fp16_weight_views;
   if (opt_config.fp16_weight_arg != nullptr) {
     ArgDef fp16_weight_argdef(opt_config.fp16_weight_arg->Name(), opt_config.fp16_weight_arg->TypeAsProto());
     fp16_weight_views = AddViewForParameter(graph_defs, fp16_weight_argdef, view_shapes);
+
+    auto new_weight_argdef = AddPartitionForParameter(graph, graph_defs, weight_argdef.name, view_shapes, enabled);
+    weight_argdefs.push_back(new_weight_argdef);
+  } else {
+    std::vector<ArgDef> weight_views = AddViewForParameter(graph_defs, weight_argdef, view_shapes);
+    weight_argdefs.push_back(weight_views[partition_index]);
   }
 
-  // Update Optimizer node configs.
-  ORT_RETURN_IF_NOT(weight_views.size() == gradient_views.size());
-  for (size_t i = 0; i < weight_views.size(); i++) {
-    OptimizerNodeConfig new_config = opt_config;
-    new_config.enabled = enabled[i];
-
-    if (opt_config.fp16_weight_arg != nullptr) {
-      new_config.fp16_weight_arg = &graph.GetOrCreateNodeArg(fp16_weight_views[i].name, fp16_weight_views[i].type_proto);
-    }
-
-    opt_configs.push_back(new_config);
+  // Update Optimizer node config.
+  OptimizerNodeConfig new_config = opt_config;
+  new_config.enabled = true;
+  if (opt_config.fp16_weight_arg != nullptr) {
+    new_config.fp16_weight_arg = &graph.GetOrCreateNodeArg(fp16_weight_views[partition_index].name, fp16_weight_views[partition_index].type_proto);
   }
+  opt_configs.push_back(new_config);
 
   return Status::OK();
 }
@@ -233,23 +290,23 @@ static Status ModifyParametersForOptimizerPartitioning(
         int64_t size_for_current_rank = offset + tensor_count - rank_start;
         std::vector<TensorShape> view_shapes = {{size_for_previous_rank}, {size_for_current_rank}};
         std::vector<bool> enabled = {false, true};
-        AddViewForParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
-                             new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
+        PartitionParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
+                            new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
       } else if (offset >= rank_start && offset + tensor_count > rank_end) {
         int64_t size_for_current_rank = rank_end - offset;
         int64_t size_for_next_rank = offset + tensor_count - rank_end;
         std::vector<TensorShape> view_shapes = {{size_for_current_rank}, {size_for_next_rank}};
         std::vector<bool> enabled = {true, false};
-        AddViewForParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
-                             new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
+        PartitionParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
+                            new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
       } else {  // offset < rank_start && offset + tensor_count > rank_end
         int64_t size_for_previous_rank = rank_start - offset;
         int64_t size_for_current_rank = rank_end - rank_start;
         int64_t size_for_next_rank = offset + tensor_count - rank_end;
         std::vector<TensorShape> view_shapes = {{size_for_previous_rank}, {size_for_current_rank}, {size_for_next_rank}};
         std::vector<bool> enabled = {false, true, false};
-        AddViewForParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
-                             new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
+        PartitionParameters(graph, graph_defs, weight_argdef, gradient_argdef, opt_config, view_shapes, enabled,
+                            new_opt_configs, new_weight_argdefs, new_gradient_argdefs);
       }
     } else {
       // Parameter is handled by a different rank.
