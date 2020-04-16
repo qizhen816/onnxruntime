@@ -88,14 +88,6 @@ Status IExecutionFrame::ReleaseMLValueImpl(int ort_value_idx) {
   if (ort_value_idx == NodeIndexInfo::kInvalidEntry || static_cast<size_t>(ort_value_idx) >= all_values_size_) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "invalid index ", ort_value_idx);
   }
-
-  // If fence is available, check whether async read has completed or not.
-  Fence_t fence = GetMLValue(ort_value_idx).Fence();
-  if (fence && !fence->CanRelease()) {
-    // Async data reading is not done yet, defer mem release until Session.run() end.
-    return Status::OK();
-  }
-
   all_values_[ort_value_idx] = OrtValue();
   return Status::OK();
 }
@@ -224,6 +216,15 @@ ExecutionFrame::ExecutionFrame(const std::vector<int>& feed_mlvalue_idxs, const 
         }
       }
     }
+
+    // setup group queues
+    for (const auto& alloc_plan : session_state.GetExecutionPlan()->allocation_plan) {
+      const void* p = alloc_plan.grouped_buffers.get();
+      ORT_ENFORCE(p != nullptr);
+      if (grouped_buffers_.count(p) == 0) {
+        grouped_buffers_.emplace(p, std::deque<int>());
+      }
+    }
   }
 }
 
@@ -321,7 +322,7 @@ Status ExecutionFrame::AllocateMLValueTensorSelfOwnBufferHelper(OrtValue& ort_va
 
 Status ExecutionFrame::AllocateMLValueTensorPreAllocateBuffer(OrtValue& ort_value, int ort_value_index_reuse,
                                                               MLDataType element_type, const OrtMemoryInfo& location,
-                                                              const TensorShape& shape, bool create_fence) {
+                                                              const TensorShape& shape) {
   OrtValue& ort_value_reuse = GetMutableMLValue(ort_value_index_reuse);
 
   auto* reuse_tensor = ort_value_reuse.GetMutable<Tensor>();
@@ -347,16 +348,6 @@ Status ExecutionFrame::AllocateMLValueTensorPreAllocateBuffer(OrtValue& ort_valu
   }
 
   void* reuse_buffer = reuse_tensor->MutableDataRaw();
-
-  // create fence on reused ort_value if needed
-  // TODO: differentiate reuse and alias, by add AllocKind::kAlias?
-  if (create_fence && ort_value_reuse.Fence() == nullptr) {
-    FencePtr f = GetAllocator(location)->CreateFence(&session_state_);
-    ort_value_reuse.SetFence(f);
-  }
-
-  // reused OrtValue share the same fence
-  ort_value.ShareFenceWith(ort_value_reuse);
   return AllocateTensorWithPreAllocateBufferHelper(ort_value, reuse_buffer, element_type, location, shape);
 }
 
@@ -443,19 +434,39 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(OrtValue& ort_value, int ort_
       case AllocKind::kAllocateOutput:
       case AllocKind::kAllocate: {
         ORT_RETURN_IF_ERROR(AllocateMLValueTensorSelfOwnBuffer(ort_value, ort_value_index, ml_data_type, alloc_info,
-                                                               *shape, per_alloc_plan.create_fence_if_async));
+                                                               *shape, per_alloc_plan.create_fence));
         break;
       }
       case AllocKind::kReuse: {
         int reuse_mlvalue_index = per_alloc_plan.reused_buffer;
         ORT_RETURN_IF_ERROR(AllocateMLValueTensorPreAllocateBuffer(
-            ort_value, reuse_mlvalue_index, ml_data_type, alloc_info, *shape, per_alloc_plan.create_fence_if_async));
+            ort_value, reuse_mlvalue_index, ml_data_type, alloc_info, *shape));
         break;
       }
       case AllocKind::kShare: {
         int reuse_mlvalue_index = per_alloc_plan.reused_buffer;
         // copy at the OrtValue level so the shared_ptr for the data is shared between the two OrtValue instances
         ort_value = GetMutableMLValue(reuse_mlvalue_index);
+        break;
+      }
+      case AllocKind::kGroupAllocate: {
+        ORT_ENFORCE(per_alloc_plan.create_fence);
+        // Async buffers with fence would be added to tail of its group queue
+        auto* ort_value_group = FindOrtValueGroup(per_alloc_plan.grouped_buffers.get());
+        ORT_ENFORCE(ort_value_group != nullptr);
+        int reuse_mlvalue_index = ort_value_group->front();
+        OrtValue& reuse_value = GetMutableMLValue(reuse_mlvalue_index);
+        if (reuse_value.Fence()->CanRelease()) {
+          // if async exec on the head of the group queue has finished, reuse
+          ort_value_group->pop_front();
+          ORT_RETURN_IF_ERROR(AllocateMLValueTensorPreAllocateBuffer(
+              ort_value, reuse_mlvalue_index, ml_data_type, alloc_info, *shape));
+          ort_value.ShareFenceWith(reuse_value);
+        } else {
+          // nothing to reuse from the group, create a new one with a new fence
+          ORT_RETURN_IF_ERROR(AllocateMLValueTensorSelfOwnBuffer(ort_value, ort_value_index, ml_data_type, alloc_info,
+                                                                 *shape, /*create_fence*/ true));
+        }
         break;
       }
       default: {
@@ -468,7 +479,7 @@ Status ExecutionFrame::AllocateAsPerAllocationPlan(OrtValue& ort_value, int ort_
     return Status::OK();
   } else if (ml_type->IsSparseTensorType()) {
     return AllocateSparseTensor(ort_value, *ml_type, GetAllocator(alloc_info),
-                                *shape, nnz, per_alloc_plan.create_fence_if_async, session_state_);
+                                *shape, nnz, per_alloc_plan.create_fence, session_state_);
   } else if (ml_type->IsTensorSequenceType()) {
     return AllocateTensorSequence(ort_value);
   } else {
@@ -487,7 +498,21 @@ Status ExecutionFrame::CreateNodeOutputMLValueImpl(OrtValue& ort_value, int ort_
 }
 
 Status ExecutionFrame::ReleaseMLValueImpl(int ort_value_idx) {
-  ORT_RETURN_IF_ERROR(IExecutionFrame::ReleaseMLValueImpl(ort_value_idx));
+  Fence_t fence = GetMLValue(ort_value_idx).Fence();
+  if (fence) {
+    // Async buffers with fence would be added to tail of its group queue
+    const auto& alloc_plan = session_state_.GetExecutionPlan()->allocation_plan;
+    ORT_ENFORCE(ort_value_idx >= 0 && static_cast<size_t>(ort_value_idx) < alloc_plan.size());
+    const auto& per_alloc_plan = alloc_plan[ort_value_idx];
+    auto* ort_value_group = FindOrtValueGroup(per_alloc_plan.grouped_buffers.get());
+    // note it is possible for AllocKind::kAllocateOutput to have fence but not in a group
+    if (ort_value_group != nullptr) {
+      ort_value_group->push_back(ort_value_idx);
+    }
+    // keep the value in all_values_ until Session.run() end
+  } else {
+    ORT_RETURN_IF_ERROR(IExecutionFrame::ReleaseMLValueImpl(ort_value_idx));
+  }
   TraceFree(ort_value_idx);
   return Status::OK();
 }

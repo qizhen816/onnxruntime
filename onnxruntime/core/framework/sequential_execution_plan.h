@@ -28,9 +28,15 @@ struct AllocPlanPerValue {
   // reused_buffer is valid only if alloc_kind == kReuse. It indicates
   // which OrtValue's buffer must be reused for this OrtValue.
   OrtValueIndex reused_buffer{0};
-  // if the value is used in async kernel, a fence object would be created
-  // note the fence object would be shared between MLValues reusing the same buffer
-  bool create_fence_if_async{false};
+  // grouped_buffers is non-empty only if alloc_kind == kGroupAllocate, when the value is used in async kernels.
+  // 1. In allocation planning, fenced values with the same shape and device would be put in grouped_buffers
+  //    note it requires shape inference info, and undetermined shapes would not be treated as the same group
+  // 2. ExecFrame maintains a queue of pending buffers for each group
+  // 3. when trying to allocate value, ORT would check the head of group queue (oldest) to see
+  //    if the head buffer's fence has passed. If so, pop the head to reuse; if not, allocate a new value
+  // 4. When the aync kernel's compute is done, put the value at the tail of the group queue
+  bool create_fence{false};  // note that kAllocateOutput may have fence but no group
+  std::shared_ptr<std::unordered_set<OrtValueIndex>> grouped_buffers;
 
  public:
   AllocPlanPerValue() : location(CPU, Invalid) {}
